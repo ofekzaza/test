@@ -5,6 +5,45 @@ import pandas as pd
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from scipy.signal import savgol_filter, find_peaks
+import cv2
+
+def remove_blue(raw):
+    # 1. Open image and ensure it is RGB (3 channels) or RGBA (4 channels)
+    # raw = Image.open(image_path).convert("RGB")
+    
+    # 2. Convert to NumPy array
+    data = np.array(raw)
+    
+    # 3. Set the Blue channel to 0
+    # Syntax: [all rows, all columns, channel index 2] (0=R, 1=G, 2=B)
+    data[:, :, 2] = 0
+    # data[:, :, 2] = np.sqrt(data[:, :, 2])
+
+    # data[:, :, 1] = np.maximum(0, data[:, :, 1] - 60)
+    # data[:, :, 1] = np.sqrt(data[:, :, 1])
+    # data[:, :, 0] = np.maximum(0, data[:, :, 0] - 30)
+    
+    # 4. Convert back to Image and return
+    return Image.fromarray(data)
+
+def save_image(data, name, point=None, color='red', size=100):
+    """
+    data: The image data (numpy array)
+    name: The filename and title
+    point: A tuple (x, y) coordinates. None by default.
+    color: Color of the marker.
+    size: Size of the marker.
+    """
+    plt.imshow(data)
+    
+    # If a point is provided, plot it on top
+    if point is not None:
+        # point[0] is x (column), point[1] is y (row)
+        plt.scatter(point[0], point[1], c=color, s=size, marker='x', linewidths=3)
+        
+    plt.axis('off') 
+    plt.savefig(f"data/{name}.jpg")
+    plt.close() # Good practice to close memory
 
 def process_diffraction_image(image_path, phys_w_mm, phys_h_mm, distance_L_mm, wavelength_pm=71.1):
     """
@@ -21,31 +60,66 @@ def process_diffraction_image(image_path, phys_w_mm, phys_h_mm, distance_L_mm, w
     print(f"Output directory: {os.path.abspath(output_dir)}")
 
     # --- 1. Load and Preprocess Image ---
-    try:
-        raw = Image.open(image_path)
-        
-        img = raw.convert('L')
-    except FileNotFoundError:
-        print(f"Error: File {image_path} not found.")
-        return
+    # try:
+    raw = Image.open(image_path)
+    blueless = remove_blue(raw)
+    save_image(blueless, base_name+"_blueless")
+    img = blueless.convert('L')
 
     img_arr = np.array(img)
     # Invert: Film is negative (dark = high intensity)
     img_inverted = 255.0 - img_arr 
     h, w = img_arr.shape
     
-    # --- 2. Find Center (Highest Intensity Point) ---
-    # Smooth slightly and mask edges to find the robust beam center
+    # --- 2. Find Center (Center of Mass of Bright Circle) ---
+    # Smooth the image to reduce noise
     img_smoothed = gaussian_filter(img_inverted, sigma=5)
     
-    border = 50 # Mask 50 pixels from edges to avoid scanning artifacts
-    mask = np.zeros_like(img_smoothed)
-    mask[border:h-border, border:w-border] = 1
-    masked_img = img_smoothed * mask
+    # Create a threshold to isolate the bright central region
+    # Use a percentage of max intensity to find the bright circle
+    threshold = np.percentile(img_smoothed, 85)  # Top 15% brightest pixels
+    binary_mask = img_smoothed > threshold
     
-    cy, cx = np.unravel_index(np.argmax(masked_img), masked_img.shape)
-    center_x, center_y = int(cx), int(cy)
-    print(f"Center found at: ({center_x}, {center_y})")
+    # Apply border mask to avoid edge artifacts
+    border = 50
+    edge_mask = np.zeros_like(binary_mask, dtype=bool)
+    edge_mask[border:h-border, border:w-border] = True
+    binary_mask = binary_mask & edge_mask
+    
+    # Find the largest connected component (the main circle)
+    from scipy.ndimage import label
+    labeled, num_features = label(binary_mask)
+    
+    if num_features > 0:
+        # Find the largest component
+        component_sizes = np.bincount(labeled.ravel())[1:]  # Skip background (0)
+        if len(component_sizes) > 0:
+            largest_component = np.argmax(component_sizes) + 1
+            main_circle_mask = (labeled == largest_component)
+            
+            # Calculate center of mass of the largest bright region
+            y_coords, x_coords = np.where(main_circle_mask)
+            if len(x_coords) > 0 and len(y_coords) > 0:
+                center_x = int(np.mean(x_coords))
+                center_y = int(np.mean(y_coords))
+                print(f"Circle center found using center of mass: ({center_x}, {center_y})")
+            else:
+                # Fallback to brightest point
+                cy, cx = np.unravel_index(np.argmax(img_smoothed * edge_mask), img_smoothed.shape)
+                center_x, center_y = int(cx), int(cy)
+                print(f"Using brightest point: ({center_x}, {center_y})")
+        else:
+            # Fallback to brightest point
+            cy, cx = np.unravel_index(np.argmax(img_smoothed * edge_mask), img_smoothed.shape)
+            center_x, center_y = int(cx), int(cy)
+            print(f"Using brightest point: ({center_x}, {center_y})")
+    else:
+        # Fallback: Find center using brightest point method
+        print("No bright regions found, using brightest point method...")
+        cy, cx = np.unravel_index(np.argmax(img_smoothed * edge_mask), img_smoothed.shape)
+        center_x, center_y = int(cx), int(cy)
+        print(f"Center found at: ({center_x}, {center_y})")
+    save_image(img_smoothed, base_name+"_center", (center_x, center_y))
     
     # --- 3. Calculate Radial Profile ---
     y, x = np.indices(img_arr.shape)
@@ -194,4 +268,7 @@ FILENAME = "raw/10_1.jpg"
 DISTANCE_L_MM = 20.0
 process_diffraction_image(FILENAME, PHYS_WIDTH_MM, DISTANCE_L_MM, PHYS_HEIGHT_MM)
 
+FILENAME = "raw/eutentric.jpg"  
+DISTANCE_L_MM = 15.0
+process_diffraction_image(FILENAME, PHYS_WIDTH_MM, DISTANCE_L_MM, PHYS_HEIGHT_MM)
 
